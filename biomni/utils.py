@@ -18,7 +18,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages.base import get_msg_title_repr
 from langchain_core.tools import StructuredTool
 from langchain_core.utils.interactive_env import is_interactive_env
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PydanticUserError, TypeAdapter, ValidationError
 
 
 # Add these new functions for running R code and CLI commands
@@ -553,30 +553,49 @@ def api_schema_to_langchain_tool(api_schema, mode="generated_tool", module_name=
         "Any": Any,
     }
 
+    def resolve_type(param_type):
+        if param_type in type_mapping:
+            return type_mapping[param_type]
+        # For types not in the mapping, try a safer approach than direct eval
+        try:
+            return eval(param_type)
+        except (NameError, SyntaxError):
+            # Default to Any for unknown types
+            return Any
+
     # Create the fields and annotations
     annotations = {}
+    fields = {}
     for param in api_schema["required_parameters"]:
-        param_type = param["type"]
-        if param_type in type_mapping:
-            annotations[param["name"]] = type_mapping[param_type]
-        else:
-            # For types not in the mapping, try a safer approach than direct eval
-            try:
-                annotations[param["name"]] = eval(param_type)
-            except (NameError, SyntaxError):
-                # Default to Any for unknown types
-                annotations[param["name"]] = Any
+        annotations[param["name"]] = resolve_type(param["type"])
+        fields[param["name"]] = Field(description=param["description"])
 
-    fields = {param["name"]: Field(description=param["description"]) for param in api_schema["required_parameters"]}
+    # Optional parameters are exposed as optional fields defaulting to None. A None value means
+    # "not provided": it is not forwarded, so the callable's own Python default applies.
+    # Optional parameters whose type has no JSON Schema (e.g. callables, DataFrames) cannot be
+    # supplied by a tool-calling LLM and would break tool binding, so they are left out.
+    optional_names = set()
+    for param in api_schema.get("optional_parameters", []):
+        try:
+            annotation = resolve_type(param["type"]) | None
+            TypeAdapter(annotation, config=ConfigDict(arbitrary_types_allowed=True)).json_schema()
+        except (TypeError, PydanticUserError):
+            continue
+        annotations[param["name"]] = annotation
+        fields[param["name"]] = Field(default=None, description=param["description"])
+        optional_names.add(param["name"])
 
     # Create the ApiInput class dynamically
     ApiInput = type("Input", (CustomBaseModel,), {"__annotations__": annotations, **fields})
     # Set the api_schema
     ApiInput.set_api_schema(api_schema)
 
+    def call_with_provided_args(**kwargs):
+        return api_function(**{k: v for k, v in kwargs.items() if not (k in optional_names and v is None)})
+
     # Create the StructuredTool
     api_tool = StructuredTool.from_function(
-        func=api_function,
+        func=call_with_provided_args,
         name=api_schema["name"],
         description=api_schema["description"],
         args_schema=ApiInput,
