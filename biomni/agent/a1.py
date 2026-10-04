@@ -5,7 +5,7 @@ import re
 from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from pydantic import AfterValidator
 
 from biomni.config import default_config
 from biomni.know_how import KnowHowLoader
@@ -46,6 +47,76 @@ from biomni.utils import (
 if os.path.exists(".env"):
     load_dotenv(".env", override=False)
     print("Loaded environment variables from .env")
+
+
+def _ndarray_from_json(value):
+    """Convert a validated JSON array into the numpy.ndarray the tool expects."""
+    import numpy as np
+
+    return np.asarray(value)
+
+
+# Exact Biomni registry type spellings -> MCP (JSON Schema) parameter annotations.
+# Only precision written in the registry is expressed (element types, tuple arity).
+_MCP_PARAM_TYPES = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "dict": dict,
+    "List[str]": list[str],
+    "list[str]": list[str],
+    "list of str": list[str],
+    "list": list,
+    "array-like": list,
+    "list or numpy.ndarray": list,
+    "List or numpy.ndarray": list,
+    "numpy.ndarray or list": list,
+    "numpy.ndarray": Annotated[list, AfterValidator(_ndarray_from_json)],
+    "List[int]": list[int],
+    "List[float]": list[float],
+    "List[float] or numpy.ndarray": list[float],
+    "List[dict]": list[dict],
+    "list of dict": list[dict],
+    "List[Dict[str, str]]": list[dict[str, str]],
+    "Optional[List[Dict[str, str]]]": list[dict[str, str]] | None,
+    "tuple": tuple,
+    "tuple or None": tuple | None,
+    "Tuple[str, str]": tuple[str, str],
+    "Tuple[int, int]": tuple[int, int],
+    "str|list[str]": str | list[str],
+    "Union[str, List[str]]": str | list[str],
+    "int|str": int | str,
+    "str or dict": str | dict,
+    "dict or array-like": dict | list,
+}
+
+# Registry types that cannot be sent as JSON. Optional parameters of these types are
+# omitted from the MCP schema so the tool's own default applies.
+_MCP_NON_JSON_TYPES = frozenset({"callable", "pd.DataFrame"})
+
+
+def _resolve_mcp_param_type(func_name, param_info, required):
+    """Return the MCP annotation for a registry parameter, or None to omit it.
+
+    Raises ValueError for unknown spellings and for required non-JSON parameters,
+    so the tool is skipped at registration instead of receiving a wrong schema.
+    """
+    param_name = param_info["name"]
+    type_str = param_info["type"]
+    if type_str in _MCP_NON_JSON_TYPES:
+        if required:
+            raise ValueError(
+                f"Tool '{func_name}': required parameter '{param_name}' has registry type "
+                f"{type_str!r}, which cannot be passed over MCP"
+            )
+        return None
+    try:
+        return _MCP_PARAM_TYPES[type_str]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"Tool '{func_name}': parameter '{param_name}' has unsupported registry type {type_str!r}"
+        ) from None
 
 
 class AgentState(TypedDict):
@@ -2542,6 +2613,12 @@ Each library is listed with its description to help you understand its functiona
         """Generate wrapper function based on Biomni schema format."""
         import inspect
 
+        # Resolve MCP types up front: unknown types raise, non-JSON optional params are dropped
+        required_types = [_resolve_mcp_param_type(func_name, p, required=True) for p in required_params]
+        optional_resolved = [(p, _resolve_mcp_param_type(func_name, p, required=False)) for p in optional_params]
+        optional_params = [p for p, t in optional_resolved if t is not None]
+        optional_types = [t for _, t in optional_resolved if t is not None]
+
         # Combine all parameters
         all_params = required_params + optional_params
 
@@ -2593,22 +2670,15 @@ Each library is listed with its description to help you understand its functiona
             # Create proper signature
             new_params = []
 
-            # Map your types to Python types
-            type_map = {"str": str, "int": int, "float": float, "bool": bool, "List[str]": list[str], "dict": dict}
-
             # Add required parameters
-            for param_info in required_params:
+            for param_info, param_type in zip(required_params, required_types, strict=True):
                 param_name = param_info["name"]
-                param_type_str = param_info["type"]
-                param_type = type_map.get(param_type_str, str)
 
                 new_params.append(inspect.Parameter(param_name, inspect.Parameter.KEYWORD_ONLY, annotation=param_type))
 
             # Add optional parameters
-            for param_info in optional_params:
+            for param_info, param_type in zip(optional_params, optional_types, strict=True):
                 param_name = param_info["name"]
-                param_type_str = param_info["type"]
-                param_type = type_map.get(param_type_str, str)
 
                 # Make it optional
                 optional_type = param_type | None
