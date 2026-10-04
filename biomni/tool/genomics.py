@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-import esm
 import gget
 import gseapy
 import numpy as np
@@ -9,7 +8,6 @@ import pandas as pd
 import requests
 import scanpy as sc
 import torch
-from pybiomart import Dataset
 from tqdm import tqdm
 
 from biomni.llm import get_llm
@@ -205,6 +203,8 @@ def interspecies_gene_conversion(
     source_dataset_name = species_mapping[source_species]
     homolog_attribute = homolog_mapping[target_species]
 
+    from pybiomart import Dataset
+
     try:
         source_dataset = Dataset(name=source_dataset_name, host="http://www.ensembl.org")
 
@@ -340,6 +340,8 @@ def generate_gene_embeddings_with_ESM_models(
     steps.append(f"Loading ESM model: {model_name}")
     # model loading take a while, once loaded for smaller models generation is relatively fast
     # running bilion model ESM models require FSDP or GPUs with 80 GB of memory
+    import esm
+
     model, alphabet = esm.pretrained.load_model_and_alphabet(model_name)
     batch_converter = alphabet.get_batch_converter()
     model.eval()
